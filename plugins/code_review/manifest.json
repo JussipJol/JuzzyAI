@@ -1,0 +1,7 @@
+{
+  "name": "code_review",
+  "version": "1.0.0",
+  "description": "Quick code review of clipboard or last file",
+  "command": "/review",
+  "entry": "plugin.py"
+}

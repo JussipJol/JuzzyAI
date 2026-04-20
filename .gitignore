@@ -1,0 +1,10 @@
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+.env
+JuzzyAI-Setup.exe
+generate_key.py
+license.py
+test_models.py
