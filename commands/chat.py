@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import random
+import difflib
 from datetime import datetime
 
 from core.client import AIClient
@@ -48,6 +49,8 @@ STRINGS = {
             ("/project off", "Unload project context"),
             ("/reset", "Reset profile and re-register"),
             ("/onecommand <task>", "Multi-agent pipeline"),
+            ("/diff [ref]", "Review git diff with AI"),
+            ("/undo", "Undo last file operation"),
         ],
         "greeting": "Hey, {}! How can I help?",
         "loaded": "Loaded {} messages from history",
@@ -82,6 +85,14 @@ STRINGS = {
         "plugins_title": "Installed plugins",
         "no_plugins": "No plugins installed. Add folders to plugins/",
         "plugin_error": "Plugin error: {}",
+        "diff_no_git": "Not a git repository or git not found",
+        "diff_empty": "No changes found (git diff returned nothing)",
+        "diff_reviewing": "Reviewing diff with AI...",
+        "file_apply": "Apply changes to {}? [y/N] ",
+        "file_create_apply": "Create {}? [y/N] ",
+        "file_skipped": "Skipped: {}",
+        "undo_empty": "Nothing to undo",
+        "undo_done": "Reverted {} file(s)",
     },
     "ru": {
         "help_title": "JuzzyAI команды",
@@ -101,6 +112,8 @@ STRINGS = {
             ("/project off", "Выгрузить контекст проекта"),
             ("/reset", "Сбросить профиль и пройти регистрацию заново"),
             ("/onecommand <задача>", "Мульти-агентный пайплайн"),
+            ("/diff [ref]", "Проверить git diff с помощью AI"),
+            ("/undo", "Отменить последнюю операцию с файлами"),
         ],
         "greeting": "Привет, {}! Чем могу помочь?",
         "loaded": "Загружено {} сообщений из истории",
@@ -135,6 +148,14 @@ STRINGS = {
         "plugins_title": "Установленные плагины",
         "no_plugins": "Нет плагинов. Добавь папки в plugins/",
         "plugin_error": "Ошибка плагина: {}",
+        "diff_no_git": "Не git-репозиторий или git не найден",
+        "diff_empty": "Изменений нет (git diff ничего не вернул)",
+        "diff_reviewing": "Проверяю diff с помощью AI...",
+        "file_apply": "Применить изменения к {}? [y/N] ",
+        "file_create_apply": "Создать {}? [y/N] ",
+        "file_skipped": "Пропущено: {}",
+        "undo_empty": "Нечего отменять",
+        "undo_done": "Отменено файлов: {}",
     }
 }
 
@@ -167,8 +188,52 @@ def _copy_to_clipboard(text: str) -> bool:
         return False
 
 
-def process_file_ops(response: str, s: dict, log=None) -> str:
+def _make_edit_diff(old_content: str, new_content: str, path: str) -> str:
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    return "".join(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{path}", tofile=f"b/{path}", lineterm=""
+    ))
+
+
+def _undo_last(undo_stack: list, s: dict, log=None):
+    from utils.display import print_info, print_error
+    from rich.text import Text
+
+    def output(msg, markup=False):
+        if log is not None:
+            log.write(Text.from_markup(msg) if markup else Text(msg))
+        elif markup:
+            console.print(msg)
+        else:
+            print_info(msg)
+
+    if not undo_stack:
+        output(s["undo_empty"])
+        return
+    batch = undo_stack.pop()
+    count = 0
+    for entry in reversed(batch):
+        try:
+            if entry["existed"]:
+                with open(entry["path"], "w", encoding="utf-8") as f:
+                    f.write(entry["content"])
+            else:
+                if os.path.exists(entry["path"]):
+                    os.remove(entry["path"])
+            count += 1
+        except Exception as e:
+            output(f"Undo error {entry['path']}: {e}")
+    output(f"[bold green]{s['undo_done'].format(count)}[/bold green]", markup=True)
+
+
+def process_file_ops(response: str, s: dict, log=None, confirm: bool = False, undo_stack: list = None) -> str:
+    from rich.syntax import Syntax
+    from rich.panel import Panel
+
     workspace = _get_workspace_root()
+    batch = []
 
     def resolve(path):
         return path if os.path.isabs(path) else os.path.join(workspace, path)
@@ -178,6 +243,19 @@ def process_file_ops(response: str, s: dict, log=None) -> str:
             log.write(Text.from_markup(msg))
         else:
             console.print(msg)
+
+    def _show_panel(renderable, title, border):
+        panel = Panel(renderable, title=title, border_style=border)
+        if log is not None:
+            log.write(panel)
+        else:
+            console.print(panel)
+
+    def _ask(prompt_str) -> bool:
+        try:
+            return input(prompt_str).strip().lower() in ("y", "yes")
+        except (KeyboardInterrupt, EOFError):
+            return False
 
     create_pattern_new = re.compile(
         r'<create_file>\s*<path>([^<]+)</path>\s*<content>(.*?)</content>\s*</create_file>',
@@ -194,9 +272,24 @@ def process_file_ops(response: str, s: dict, log=None) -> str:
                 continue
             try:
                 abs_path = resolve(fpath)
+                ext = os.path.splitext(fpath)[1].lstrip(".") or "text"
+                _show_panel(
+                    Syntax(fcontent[:3000], ext, theme="monokai", line_numbers=True, word_wrap=False),
+                    title=f"[bold yellow]Create:[/bold yellow] {fpath}",
+                    border="yellow",
+                )
+                if confirm and not _ask(s["file_create_apply"].format(fpath)):
+                    output(f"[dim]{s['file_skipped'].format(fpath)}[/dim]")
+                    continue
+                existed = os.path.exists(abs_path)
+                old_content = ""
+                if existed:
+                    with open(abs_path, "r", encoding="utf-8") as f:
+                        old_content = f.read()
                 os.makedirs(os.path.dirname(os.path.abspath(abs_path)), exist_ok=True)
                 with open(abs_path, "w", encoding="utf-8") as f:
                     f.write(fcontent)
+                batch.append({"path": abs_path, "existed": existed, "content": old_content})
                 output(f"[bold green]{s['file_created'].format(fpath)}[/bold green]")
             except Exception as e:
                 output(f"[bold red]{s['file_error'].format(fpath, e)}[/bold red]")
@@ -228,12 +321,29 @@ def process_file_ops(response: str, s: dict, log=None) -> str:
                 if old not in fcontent:
                     output(f"[bold yellow]Warning: old text not found in {fpath}[/bold yellow]")
                     continue
-                fcontent = fcontent.replace(old, new, 1)
+                new_content = fcontent.replace(old, new, 1)
+                diff_text = _make_edit_diff(fcontent, new_content, fpath)
+                if diff_text:
+                    _show_panel(
+                        Syntax(diff_text[:4000], "diff", theme="monokai", line_numbers=False, word_wrap=False),
+                        title=f"[bold yellow]Edit:[/bold yellow] {fpath}",
+                        border="yellow",
+                    )
+                if confirm and not _ask(s["file_apply"].format(fpath)):
+                    output(f"[dim]{s['file_skipped'].format(fpath)}[/dim]")
+                    continue
                 with open(abs_path, "w", encoding="utf-8") as f:
-                    f.write(fcontent)
+                    f.write(new_content)
+                batch.append({"path": abs_path, "existed": True, "content": fcontent})
                 output(f"[bold green]{s['file_edited'].format(fpath)}[/bold green]")
             except Exception as e:
                 output(f"[bold red]{s['file_error'].format(fpath, e)}[/bold red]")
+
+    if batch:
+        if undo_stack is not None:
+            undo_stack.append(batch)
+        if log is not None:
+            log.write(Text.from_markup("[dim]  /undo to revert[/dim]"))
 
     for pat in (create_pattern_new, create_pattern_old, edit_pattern_new, edit_pattern_old):
         response = pat.sub("", response)
@@ -304,6 +414,7 @@ def _run_chat_tui(client: AIClient, session_id: str = None, profile: dict = None
         "total_tokens": 0,
         "input_history": [],
         "history_idx": -1,
+        "undo_stack": [],
     }
 
     class JuzzyApp(App):
@@ -347,7 +458,7 @@ def _run_chat_tui(client: AIClient, session_id: str = None, profile: dict = None
             self._all_commands = (
                 [c for c, _ in s["commands"]] +
                 list(self._plugins.keys()) +
-                ["/onecommand"]
+                ["/onecommand", "/diff", "/undo"]
             )
             self._is_spinning = False
             self._spinner_frames = random.choice(SPINNERS)
@@ -410,7 +521,7 @@ def _run_chat_tui(client: AIClient, session_id: str = None, profile: dict = None
         def on_list_view_selected(self, event: ListView.Selected):
             label = event.item.query_one(Label)
             inp = self.query_one("#input", Input)
-            inp.value = label.renderable
+            inp.value = str(label.renderable)
             inp.cursor_position = len(inp.value)
             self._hide_autocomplete()
             inp.focus()
@@ -422,7 +533,7 @@ def _run_chat_tui(client: AIClient, session_id: str = None, profile: dict = None
             if event.key == "tab":
                 if "visible" in ac.classes and len(ac.children) > 0:
                     first = ac.children[0].query_one(Label)
-                    inp.value = first.renderable
+                    inp.value = str(first.renderable)
                     inp.cursor_position = len(inp.value)
                     self._hide_autocomplete()
                     event.prevent_default()
@@ -646,7 +757,68 @@ def _run_chat_tui(client: AIClient, session_id: str = None, profile: dict = None
                     except Exception as e:
                         log.write(Text(s["project_error"].format(e)))
                 return
+            if cmd.startswith("/diff"):
+                self.handle_diff(cmd[5:].strip())
+                return
+            if cmd == "/undo":
+                _undo_last(state["undo_stack"], s, log=log)
+                return
             log.write(Text(f"Unknown command: {cmd}. Type /help"))
+
+        def handle_diff(self, args: str):
+            log = self.query_one("#chat", RichLog)
+
+            @work(thread=True)
+            def _exec(self):
+                from commands.diff import get_git_diff, diff_stats, build_review_prompt, make_diff_panel
+                diff_text, err = get_git_diff(args)
+
+                if err:
+                    def _err():
+                        log.write(Text.from_markup(f"[bold red]{s['diff_no_git']}: {err}[/bold red]"))
+                    self.call_from_thread(_err)
+                    return
+
+                if not diff_text.strip():
+                    def _empty():
+                        log.write(Text(s["diff_empty"]))
+                    self.call_from_thread(_empty)
+                    return
+
+                stats = diff_stats(diff_text)
+                panel = make_diff_panel(diff_text, stats)
+
+                def _show():
+                    log.write(panel)
+                    log.scroll_end()
+                self.call_from_thread(_show)
+
+                self._is_spinning = True
+                self._spinner_frames = random.choice(SPINNERS)
+                self.spin_status()
+
+                prompt_msg = build_review_prompt(diff_text, lang)
+                try:
+                    full, _, _ = client.stream_tokens(
+                        [{"role": "user", "content": prompt_msg}],
+                        state["system_prompt"],
+                    )
+
+                    def _review():
+                        self._is_spinning = False
+                        self.update_status("")
+                        log.write(Text.from_markup("[bold #8b7cff]JuzzyAI (diff review):[/bold #8b7cff]"))
+                        log.write(Markdown(full))
+                        log.scroll_end()
+                    self.call_from_thread(_review)
+                except Exception as e:
+                    def _rerr():
+                        self._is_spinning = False
+                        self.update_status("")
+                        log.write(Text(f"Review error: {e}"))
+                    self.call_from_thread(_rerr)
+
+            _exec(self)
 
         def handle_onecommand(self, prompt: str):
             """Launch /onecommand — opens dedicated TUI pipeline app."""
@@ -717,7 +889,7 @@ def _run_chat_tui(client: AIClient, session_id: str = None, profile: dict = None
             try:
                 full, pt, gt = stream_with_tokens(client, state["messages"], state["system_prompt"])
                 elapsed = time.time() - start
-                cleaned = process_file_ops(full, s, log=log)
+                cleaned = process_file_ops(full, s, log=log, undo_stack=state["undo_stack"])
                 state["last_response"] = cleaned
                 state["messages"].append({"role": "assistant", "content": full})
                 save_message(state["session_id"], "assistant", full)
@@ -811,6 +983,7 @@ def _run_chat_classic(client: AIClient, session_id: str = None, profile: dict = 
 
     plugins = load_plugins()
     system_prompt = build_system_prompt(s, name, goal, project_context)
+    undo_stack = []
 
     console.print(f"\n[bold cyan]{s['greeting'].format(name)}[/bold cyan]")
     messages = load_session(session_id)
@@ -926,6 +1099,37 @@ def _run_chat_classic(client: AIClient, session_id: str = None, profile: dict = 
             else:
                 print_info(s["nothing_to_copy"])
             continue
+        if user_input.startswith("/diff"):
+            args = user_input[5:].strip()
+            from commands.diff import get_git_diff, diff_stats, make_diff_panel, build_review_prompt
+            diff_text, err = get_git_diff(args)
+            if err:
+                print_error(f"{s['diff_no_git']}: {err}")
+            elif not diff_text.strip():
+                print_info(s["diff_empty"])
+            else:
+                console.print(make_diff_panel(diff_text, diff_stats(diff_text)))
+                print_info(s["diff_reviewing"])
+                try:
+                    start_time = time.time()
+                    full, pt, gt = stream_with_tokens(
+                        client,
+                        [{"role": "user", "content": build_review_prompt(diff_text, lang)}],
+                        system_prompt,
+                    )
+                    elapsed = time.time() - start_time
+                    console.print("\n[bold green]JuzzyAI (diff review):[/bold green]")
+                    print_markdown(full)
+                    if pt or gt:
+                        print(f"\033[90m{s['tokens'].format(client.model, pt, gt, elapsed)}\033[0m")
+                    else:
+                        print(f"\033[90m{s['elapsed'].format(client.model, elapsed)}\033[0m")
+                except Exception as e:
+                    print_error(str(e))
+            continue
+        if user_input == "/undo":
+            _undo_last(undo_stack, s)
+            continue
         if user_input == "/reset":
             profile_path = os.path.expanduser("~/.juzzyai/profile.json")
             if os.path.exists(profile_path):
@@ -940,7 +1144,7 @@ def _run_chat_classic(client: AIClient, session_id: str = None, profile: dict = 
             start_time = time.time()
             full_response, prompt_tokens, generated_tokens = stream_with_tokens(client, messages, system_prompt)
             elapsed = time.time() - start_time
-            cleaned_response = process_file_ops(full_response, s)
+            cleaned_response = process_file_ops(full_response, s, confirm=True, undo_stack=undo_stack)
 
             term_width = shutil.get_terminal_size().columns or 80
             line_count = sum(max(1, (len(line) + term_width - 1) // term_width) for line in full_response.splitlines()) + 1
