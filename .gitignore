@@ -8,3 +8,4 @@ JuzzyAI-Setup.exe
 generate_key.py
 license.py
 test_models.py
+claude/

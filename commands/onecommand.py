@@ -244,29 +244,41 @@ class AgentState:
     iteration: int = 0
     total_iterations: int = DEFAULT_ITERATIONS
     error: str = ""
+    phase: str = "waiting"
+    agent_started_at: float = field(default_factory=time.time)
 
 
 # ─── Pipeline runner ──────────────────────────────────────────────────────────
 
 class PipelineRunner:
     def __init__(self, client: AIClient, user_prompt: str, iterations: int = DEFAULT_ITERATIONS):
-        self.client        = client
-        self.user_prompt   = user_prompt
-        self.iterations    = iterations
+        self.client           = client
+        self.user_prompt      = user_prompt
+        self.iterations       = iterations
         self.agents: list[AgentState] = []
-        self.final_result  = ""
-        self.router_done   = False
-        self.pipeline_done = False
+        self.final_result     = ""
+        self.router_done      = False
+        self.pipeline_done    = False
+        self.pipeline_phase   = "init"   # routing | agents | merging | done
         self.ops_log: list[str] = []
-        self.log_dir: str  = ""
-        self.started_at    = datetime.now()
-        self.lock          = threading.Lock()
-        self._cb           = None
-        self._stop         = False
+        self.log_dir: str     = ""
+        self.started_at       = datetime.now()
+        self.lock             = threading.Lock()
+        self._cb              = None
+        self._stop            = False
         self._enriched_prompt = ""
+        self._heartbeat: threading.Thread | None = None
 
     def stop(self):
         self._stop = True
+
+    def _start_heartbeat(self):
+        def _beat():
+            while not self._stop and not self.pipeline_done:
+                time.sleep(0.5)
+                self._notify()
+        self._heartbeat = threading.Thread(target=_beat, daemon=True)
+        self._heartbeat.start()
 
     def on_update(self, cb):
         self._cb = cb
@@ -284,10 +296,13 @@ class PipelineRunner:
         return self.client.send(messages)
 
     def run_router(self):
-        # Create log dir at start
         self.log_dir = _make_log_dir()
         _append(os.path.join(self.log_dir, "ops.log"),
                 f"[{self.started_at.strftime('%H:%M:%S')}] Pipeline started: {self.user_prompt[:100]}")
+
+        self.pipeline_phase = "routing"
+        self._start_heartbeat()
+        self._notify()
 
         enriched_prompt = _inject_workspace_files(self.user_prompt)
         response = self._call([{"role": "user", "content": ROUTER_PROMPT.format(user_prompt=enriched_prompt)}])
@@ -318,6 +333,7 @@ class PipelineRunner:
         with self.lock:
             self.agents = agents
             self.router_done = True
+            self.pipeline_phase = "agents"
 
         # Log router result
         _write(os.path.join(self.log_dir, "run.json"), json.dumps({
@@ -334,9 +350,10 @@ class PipelineRunner:
             return
         with self.lock:
             agent.status = "running"
+            agent.phase = "thinking..."
+            agent.agent_started_at = time.time()
         self._notify()
         try:
-            # Use enriched prompt (with workspace files) for initial call
             enriched = self._enriched_prompt if self._enriched_prompt else agent.prompt
             result = self._call([
                 {"role": "system", "content": agent.role},
@@ -354,6 +371,8 @@ class PipelineRunner:
                 if self._stop:
                     break
                 peer = None
+                with self.lock:
+                    agent.phase = "waiting for peer..."
                 for _ in range(40):
                     if self._stop:
                         break
@@ -366,6 +385,9 @@ class PipelineRunner:
                     time.sleep(0.3)
 
                 if peer and not self._stop:
+                    with self.lock:
+                        agent.phase = f"reviewing with {peer.name}..."
+                    self._notify()
                     result = self._call([
                         {"role": "system", "content": agent.role},
                         {"role": "user", "content": REFINE_PROMPT.format(
@@ -384,6 +406,7 @@ class PipelineRunner:
 
             with self.lock:
                 agent.status = "done"
+                agent.phase = "done"
             self._notify()
 
             # Log agent result
@@ -416,6 +439,9 @@ class PipelineRunner:
         done = [a for a in self.agents if a.status == "done"]
         if not done:
             return "All agents failed."
+
+        self.pipeline_phase = "merging"
+        self._notify()
 
         result = self._call([{"role": "user", "content": MERGE_PROMPT.format(
             user_prompt=self.user_prompt,
@@ -492,8 +518,12 @@ def run_onecommand_tui(client, user_prompt, iterations, s):
                 yield RichLog(id="result", wrap=True, markup=False)
                 yield Static("  Initializing...  [Q/Esc] stop & quit", id="status")
 
+        SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
         def on_mount(self):
             self._widgets: dict[int, Static] = {}
+            self._spin_idx = 0
+            self.set_interval(0.5, self._refresh)
             self.start_pipeline()
 
         def _label(self, a: AgentState) -> str:
@@ -501,21 +531,31 @@ def run_onecommand_tui(client, user_prompt, iterations, s):
             colors = {"waiting": "#4a4a66", "running": "#8b7cff", "done": "#00cc88", "error": "#cc3333"}
             icon  = icons.get(a.status, "○")
             color = colors.get(a.status, "#4a4a66")
-            bar = ""
+            suffix = ""
             if a.status == "running":
                 filled = int(10 * a.iteration / max(a.total_iterations, 1))
-                bar = f"  [{'█'*filled}{'░'*(10-filled)}] {a.iteration}/{a.total_iterations}"
-            return f"[bold {color}]{icon}  {a.name}[/bold {color}]{bar}"
+                elapsed = int(time.time() - a.agent_started_at)
+                spin = self.SPINNER[self._spin_idx % len(self.SPINNER)]
+                suffix = (f"  {spin} [{'█'*filled}{'░'*(10-filled)}]"
+                          f"  iter {a.iteration}/{a.total_iterations}"
+                          f"  ·  {a.phase}"
+                          f"  ·  {elapsed}s")
+            elif a.status == "error":
+                suffix = f"  ✗ {a.error[:40]}"
+            return f"[bold {color}]{icon}  {a.name}[/bold {color}]{suffix}"
 
         def _refresh(self):
+            self._spin_idx += 1
             panel   = self.query_one("#agents", Vertical)
             ops_log = self.query_one("#ops", RichLog)
             with runner.lock:
-                agents      = list(runner.agents)
-                router_done = runner.router_done
-                done        = runner.pipeline_done
-                ops         = list(runner.ops_log)
-                log_dir     = runner.log_dir
+                agents        = list(runner.agents)
+                router_done   = runner.router_done
+                done          = runner.pipeline_done
+                phase         = runner.pipeline_phase
+                ops           = list(runner.ops_log)
+                log_dir       = runner.log_dir
+                elapsed_total = int((datetime.now() - runner.started_at).total_seconds())
 
             for a in agents:
                 if a.task_id not in self._widgets:
@@ -532,15 +572,22 @@ def run_onecommand_tui(client, user_prompt, iterations, s):
                 for line in ops[-8:]:
                     ops_log.write(Text(line))
 
+            mins, secs = divmod(elapsed_total, 60)
+            timer = f"{mins}:{secs:02d}"
+
             if not router_done:
-                st = "  Analyzing task...  [Q] stop"
+                spin = self.SPINNER[self._spin_idx % len(self.SPINNER)]
+                st = f"  {spin} Routing task...  ·  {timer}  ·  [Q] stop"
+            elif phase == "merging":
+                spin = self.SPINNER[self._spin_idx % len(self.SPINNER)]
+                st = f"  {spin} Merging results...  ·  {timer}  ·  [Q] stop"
             elif not done:
                 running  = sum(1 for a in agents if a.status == "running")
                 finished = sum(1 for a in agents if a.status == "done")
-                st = f"  {finished}/{len(agents)} done  ·  {running} running  ·  [Q] stop"
+                st = f"  ⏱ {timer}  ·  {finished}/{len(agents)} done  ·  {running} running  ·  [Q] stop"
             else:
                 log_hint = f"  ·  log: {log_dir}" if log_dir else ""
-                st = f"  Complete{log_hint}  ·  [Q] quit"
+                st = f"  ✓ Done in {timer}{log_hint}  ·  [Q] quit"
             self.query_one("#status", Static).update(st)
 
         @work(thread=True)
@@ -571,28 +618,50 @@ def run_onecommand_tui(client, user_prompt, iterations, s):
 
 def run_onecommand_classic(client, user_prompt, iterations, s):
     from utils.markdown import print_markdown
-    C="\033[36m"; G="\033[32m"; R="\033[31m"; D="\033[90m"; X="\033[0m"
+    C="\033[36m"; G="\033[32m"; R="\033[31m"; D="\033[90m"; Y="\033[33m"; X="\033[0m"
+    SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     print(f"\n{C}⚡ /onecommand{X}  (Ctrl+C to stop)\n")
 
     runner = PipelineRunner(client, user_prompt, iterations)
     drawn = [0]
+    spin_i = [0]
 
     def on_update():
+        spin_i[0] += 1
+        sp = SPIN[spin_i[0] % len(SPIN)]
+        elapsed = int((datetime.now() - runner.started_at).total_seconds())
+        mins, secs = divmod(elapsed, 60)
+        timer = f"{mins}:{secs:02d}"
+
         with runner.lock:
             agents = list(runner.agents)
-            if not runner.router_done:
-                return
-        lines = []
-        for a in agents:
-            if   a.status == "waiting": icon = f"{D}○{X}"
-            elif a.status == "running":
-                f = int(10 * a.iteration / max(a.total_iterations, 1))
-                icon = f"{C}◉{X} [{'█'*f}{'░'*(10-f)}] {a.iteration}/{a.total_iterations}"
-            elif a.status == "done":    icon = f"{G}✓{X}"
-            else:                       icon = f"{R}✗ {a.error[:40]}{X}"
-            lines.append(f"  {icon}  {a.name}")
+            phase  = runner.pipeline_phase
+            router_done = runner.router_done
+
+        if not router_done:
+            lines = [f"  {sp} {C}routing task...{X}  {D}{timer}{X}"]
+        elif phase == "merging":
+            lines = [f"  {sp} {Y}merging results...{X}  {D}{timer}{X}"]
+        else:
+            lines = []
+            for a in agents:
+                if a.status == "waiting":
+                    row = f"{D}○  {a.name}{X}"
+                elif a.status == "running":
+                    f = int(10 * a.iteration / max(a.total_iterations, 1))
+                    age = int(time.time() - a.agent_started_at)
+                    row = (f"{C}{sp}  {a.name}{X}"
+                           f"  [{'█'*f}{'░'*(10-f)}] {a.iteration}/{a.total_iterations}"
+                           f"  {D}{a.phase}  {age}s{X}")
+                elif a.status == "done":
+                    row = f"{G}✓  {a.name}{X}"
+                else:
+                    row = f"{R}✗  {a.name}  {a.error[:40]}{X}"
+                lines.append(f"  {row}")
+            lines.append(f"  {D}⏱ {timer}{X}")
+
         if drawn[0]:
-            print(f"\033[{drawn[0]}A", end="")
+            print(f"\033[{drawn[0]}A\033[J", end="")
         print("\n".join(lines), flush=True)
         drawn[0] = len(lines)
 
