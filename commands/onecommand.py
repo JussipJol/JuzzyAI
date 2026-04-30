@@ -593,7 +593,18 @@ def run_onecommand_tui(client, user_prompt, iterations, s):
         @work(thread=True)
         def start_pipeline(self):
             runner.on_update(lambda: self.call_from_thread(self._refresh))
-            final = runner.run()
+            try:
+                final = runner.run()
+            except Exception as exc:
+                def show_err(msg=str(exc)):
+                    self.query_one("#result", RichLog).write(
+                        Text(f"✗ Error: {msg}", style="bold red")
+                    )
+                    self.query_one("#status", Static).update(
+                        f"  ✗ Failed  ·  [Q] quit"
+                    )
+                self.call_from_thread(show_err)
+                return
 
             def show():
                 self.query_one("#result", RichLog).write(Markdown(final))

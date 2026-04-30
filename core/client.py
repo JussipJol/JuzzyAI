@@ -16,6 +16,10 @@ OPENROUTER_FALLBACKS = [
 ]
 
 
+class RateLimitError(RuntimeError):
+    """Raised when a provider returns 429 after all retries."""
+
+
 def _request_with_retry(make_req_fn, provider, max_retries=MAX_RETRIES):
     for attempt in range(max_retries):
         try:
@@ -33,8 +37,8 @@ def _request_with_retry(make_req_fn, provider, max_retries=MAX_RETRIES):
                     f"Check your plan or generate a new key."
                 )
             if e.code == 429:
-                wait = RETRY_DELAY * (attempt + 1)
-                print(f"\n\033[33m⚠ Rate limit, retrying in {wait}s...\033[0m")
+                wait = RETRY_DELAY * (2 ** attempt)   # 2, 4, 8, 16…
+                print(f"\n\033[33m⚠ Rate limit ({provider}), retrying in {wait}s...\033[0m")
                 time.sleep(wait)
                 continue
             if e.code >= 500 and attempt < max_retries - 1:
@@ -47,7 +51,7 @@ def _request_with_retry(make_req_fn, provider, max_retries=MAX_RETRIES):
                 time.sleep(RETRY_DELAY)
                 continue
             raise RuntimeError(f"{provider} network error: {e}")
-    raise RuntimeError(f"{provider} failed after {max_retries} retries")
+    raise RateLimitError(f"{provider} rate-limited after {max_retries} retries")
 
 
 class AIClient:
@@ -224,9 +228,36 @@ class AIClient:
         )
 
     def _call_openrouter(self, messages, system_prompt=""):
-        return self._call_openai_compat(
-            messages, system_prompt,
-            "https://openrouter.ai/api/v1/chat/completions",
+        url  = "https://openrouter.ai/api/v1/chat/completions"
+        msgs = self._build_msgs(messages, system_prompt)
+        models = [self.model] + [m for m in OPENROUTER_FALLBACKS if m != self.model]
+
+        last_err: Exception = RuntimeError("openrouter: no models available")
+        for model in models:
+            payload = json.dumps({"model": model, "messages": msgs}).encode()
+
+            def do_request(p=payload):
+                req = urllib.request.Request(url, data=p, headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                    "User-Agent":    "Mozilla/5.0",
+                })
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                    return json.loads(r.read())["choices"][0]["message"]["content"]
+
+            try:
+                return _request_with_retry(do_request, f"openrouter/{model}", max_retries=2)
+            except RateLimitError as e:
+                last_err = e
+                print(f"\n\033[33m⚠ {model} rate-limited, trying next model...\033[0m")
+                time.sleep(3)
+                continue
+            except RuntimeError:
+                raise   # auth errors, API errors — don't mask
+
+        raise RuntimeError(
+            f"All OpenRouter models rate-limited. Try again in a minute.\n"
+            f"Tip: switch to Groq or Ollama for heavy tasks like /onecommand."
         )
 
     def _call_gemini(self, messages, system_prompt=""):
